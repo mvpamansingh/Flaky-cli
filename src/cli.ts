@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { runInit } from "./commands/init.js";
 import { renderBanner } from "./theme/banner.js";
 
 const program = new Command();
@@ -12,6 +13,13 @@ program
   // This will show the Xenolith banner above the help text.
   .addHelpText("beforeAll", renderBanner());
 
+program
+  .command("init")
+  .description("Interactively scaffold a flaky.config.json")
+  .option("-c, --config <path>", "where to write the config", "./flaky.config.json")
+  .action(async (opts: { config?: string }) => {
+    await runInit({ config: opts.config });
+  });
 
 program.action(() => {
   program.outputHelp();
