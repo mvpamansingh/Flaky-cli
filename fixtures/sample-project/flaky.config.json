@@ -1,0 +1,10 @@
+{
+  "command": "npm test",
+  "reporter": "junit",
+  "resultsPath": "./reports/junit.xml",
+  "times": 20,
+  "timeoutMs": 300000,
+  "isolate": false,
+  "isolationRuns": 10,
+  "isolateCommand": "npx vitest run {file} -t \"{testName}\""
+}

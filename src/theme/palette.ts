@@ -1,4 +1,3 @@
-
 export const palette = {
   brand: "#00F5D4", // my hero color bioluminescent cyan — banner, highlights
   secondary: "#5EF38C", // alien green — stable/good
@@ -9,6 +8,5 @@ export const palette = {
   muted: "#6B7A8F", // secondary info
   dim: "#8892B0", // using it for hints
 } as const;
-
 
 export const bannerGradient = [palette.gradientFrom, palette.gradientTo] as const;
