@@ -1,5 +1,5 @@
 {
-  "command": "npm test",
+  "command": "npm test -- --outputFile.junit=\"{results}\"",
   "reporter": "junit",
   "resultsPath": "./reports/junit.xml",
   "times": 20,
