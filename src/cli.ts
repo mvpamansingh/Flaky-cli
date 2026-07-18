@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import { runInit } from "./commands/init.js";
+import { runCommand } from "./commands/run.js";
 import { renderBanner } from "./theme/banner.js";
 
 const program = new Command();
@@ -19,6 +20,14 @@ program
   .option("-c, --config <path>", "where to write the config", "./flaky.config.json")
   .action(async (opts: { config?: string }) => {
     await runInit({ config: opts.config });
+  });
+
+program
+  .command("run")
+  .description("Run the test suite repeatedly and detect flaky tests")
+  .option("-c, --config <path>", "config location", "./flaky.config.json")
+  .action(async (opts: { config?: string }) => {
+    await runCommand({ config: opts.config });
   });
 
 program.action(() => {
