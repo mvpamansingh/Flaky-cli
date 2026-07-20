@@ -26,6 +26,7 @@
     "chalk": "^5.4.1",
     "commander": "^13.1.0",
     "execa": "^9.6.1",
+    "fast-xml-parser": "^5.10.1",
     "figlet": "^1.8.0",
     "gradient-string": "^3.0.0",
     "zod": "^4.4.3"
