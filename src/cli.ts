@@ -26,8 +26,9 @@ program
   .command("run")
   .description("Run the test suite repeatedly and detect flaky tests")
   .option("-c, --config <path>", "config location", "./flaky.config.json")
-  .action(async (opts: { config?: string }) => {
-    await runCommand({ config: opts.config });
+  .option("-n, --times <count>", "number of full-suite runs (overrides config)")
+  .action(async (opts: { config?: string; times?: string }) => {
+    await runCommand({ config: opts.config, times: opts.times });
   });
 
 program.action(() => {

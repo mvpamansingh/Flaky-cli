@@ -1,22 +1,30 @@
 import { dirname, isAbsolute, resolve } from "node:path";
 import { loadConfig } from "../config/load.js";
-import { runOnce } from "../core/runner.js";
+import { correlate } from "../core/correlate.js";
+import { sweep } from "../core/sweep.js";
 import { getParser } from "../parsers/index.js";
-import type { RawRun, RunResult } from "../types.js";
+import type { FlakeReport, RunResult } from "../types.js";
+import { formatDuration } from "../utils/timing.js";
 
 /**
  * `flaky run` — the pipeline conductor.
  *
- * PHASE 4 SCOPE: still a SINGLE run, but the captured results file is now
- * PARSED into a normalized `RunResult` via the reporter's adapter, and the run
- * reports a real test count + pass/fail/skip breakdown. Phase 5 wraps `runOnce`
- * in the sequential N-times loop and correlates; Phase 6 adds the themed report.
- * Logs go to stderr so stdout stays clean for the future `--json` mode (rule #5).
+ * PHASE 5 SCOPE: runs the command N times **sequentially** (rule #1), correlates
+ * results across runs into `FlakeReport[]`, and prints a plain-text summary.
+ * Phase 6 replaces that summary with the themed Xenolith table.
+ *
+ * Output discipline (rule #5, prep for `--json` in Phase 8): progress/logs go to
+ * **stderr**; the final report is the tool's *result*, so it goes to **stdout**.
  */
 
 export interface RunOptions {
   config?: string;
+  /** Raw `-n/--times` value from commander (string); parsed + validated here. */
+  times?: string;
 }
+
+/** Projected sweep time at or above which we warn the user (SPEC §6). */
+const LARGE_SWEEP_MS = 5 * 60_000;
 
 export async function runCommand(opts: RunOptions): Promise<void> {
   const configPath = opts.config ?? "./flaky.config.json";
@@ -42,65 +50,71 @@ export async function runCommand(opts: RunOptions): Promise<void> {
     return;
   }
 
+  // Resolve N: an explicit `-n/--times` overrides the config default.
+  let times = config.times;
+  if (opts.times !== undefined) {
+    const parsed = Number(opts.times);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      process.stderr.write(`✗ --times must be a positive integer (got "${opts.times}").\n`);
+      process.exitCode = 1;
+      return;
+    }
+    times = parsed;
+  }
+
   // Run the command where the user's project lives, so its command and
   // resultsPath resolve relative to the project — not to our CLI's cwd.
   const cwd = dirname(absConfig);
 
-  process.stderr.write(`⟁ Scanning specimen 1/1 — ${config.command}\n`);
-  const raw = await runOnce({ config, runIndex: 1, cwd });
+  const runs = await sweep({
+    config,
+    parser,
+    times,
+    cwd,
+    onRunStart: (i, total) => {
+      process.stderr.write(`⟁ Scanning specimen ${i}/${total} — ${config.command}\n`);
+    },
+    onRunComplete: ({ runIndex, total, run, elapsedMs }) => {
+      process.stderr.write(`  ↳ ${describeRun(run)} — ${formatDuration(elapsedMs)}\n`);
 
-  const run = toRunResult(raw, parser);
-  if (run.crashed) {
-    // The tool couldn't produce a usable report — an operational failure (like a
-    // config error), not a flaky-test *finding*, so it exits non-zero. This is a
-    // SINGLE run; Phase 5 exits non-zero only when NO run in the sweep yields
-    // usable results — a report built from surviving runs still exits 0.
-    process.stderr.write(`✗ Runner crashed: ${raw.crashReason}\n`);
+      // First-run duration estimate + large-sweep warning (SPEC §6). Only worth
+      // it when more runs remain.
+      if (runIndex === 1 && total > 1) {
+        const projected = elapsedMs * total;
+        process.stderr.write(
+          `⟁ Estimated sweep time: ~${formatDuration(projected)} (${total} runs).\n`,
+        );
+        if (projected >= LARGE_SWEEP_MS) {
+          process.stderr.write(
+            "⚠ This is a long sweep. Press Ctrl-C to abort, or re-run with a smaller --times.\n",
+          );
+        }
+      }
+    },
+  });
+
+  const usableRuns = runs.filter((r) => !r.crashed).length;
+  const crashedRuns = runs.length - usableRuns;
+
+  // Exit non-zero only when NO run yielded usable results (Decisions log
+  // threshold). A report built from *surviving* runs still exits 0.
+  if (usableRuns === 0) {
+    const firstReason = runs.find((r) => r.crashReason)?.crashReason;
+    const detail = firstReason ? ` First failure: ${firstReason}` : "";
+    process.stderr.write(
+      `✗ No usable runs — all ${runs.length} crashed. Nothing to report.${detail}\n`,
+    );
     process.exitCode = 1;
     return;
   }
 
-  const timeoutNote = run.timedOut ? " (timed out)" : "";
-  const { total, pass, fail, skip } = countByStatus(run);
-  process.stderr.write(
-    `✓ Run complete — runner exit ${run.runnerExitCode}${timeoutNote}; ` +
-      `parsed ${total} tests (${pass} pass, ${fail} fail, ${skip} skip)\n`,
-  );
+  const reports = correlate(runs);
+  renderSummary(reports, usableRuns, crashedRuns, runs.length);
 }
 
-/**
- * Turn a raw (unparsed) run into a fully-parsed {@link RunResult}.
- *
- * A run that the runner already flagged as crashed stays crashed. Otherwise we
- * parse `resultsXml`; if parsing throws, the file is unparseable — which SPEC §6
- * treats as a crashed run (the runner produced something, but not usable
- * results), NOT as a run where tests merely failed.
- */
-function toRunResult(raw: RawRun, parser: ReturnType<typeof getParser>): RunResult {
-  const base = {
-    runIndex: raw.runIndex,
-    startedAt: raw.startedAt,
-    runnerExitCode: raw.runnerExitCode,
-    timedOut: raw.timedOut,
-  };
-  if (raw.crashed) {
-    return { ...base, results: [], crashed: true };
-  }
-  try {
-    const results = parser.parse(raw.resultsXml ?? "");
-    return { ...base, results, crashed: false };
-  } catch (err) {
-    raw.crashReason = `Could not parse results at ${raw.resultsPath}: ${(err as Error).message}`;
-    return { ...base, results: [], crashed: true };
-  }
-}
-
-function countByStatus(run: RunResult): {
-  total: number;
-  pass: number;
-  fail: number;
-  skip: number;
-} {
+/** One-line description of a single run, for the progress stream (stderr). */
+function describeRun(run: RunResult): string {
+  if (run.crashed) return `crashed — ${run.crashReason ?? "no usable results"}`;
   let pass = 0;
   let fail = 0;
   let skip = 0;
@@ -109,5 +123,49 @@ function countByStatus(run: RunResult): {
     else if (r.status === "fail") fail++;
     else skip++;
   }
-  return { total: run.results.length, pass, fail, skip };
+  const timeout = run.timedOut ? " (timed out)" : "";
+  return `exit ${run.runnerExitCode}${timeout}; ${run.results.length} tests (${pass} pass, ${fail} fail, ${skip} skip)`;
+}
+
+/**
+ * Plain-text sweep summary → stdout (the tool's *result*). Phase 6 replaces this
+ * with the themed `cli-table3` report; keeping it plain now means output is
+ * already pipe-safe and stdout carries only the report.
+ */
+function renderSummary(
+  reports: FlakeReport[],
+  usableRuns: number,
+  crashedRuns: number,
+  totalRuns: number,
+): void {
+  const flaky = reports.filter((r) => r.classification === "flaky");
+  const failing = reports.filter((r) => r.classification === "consistently-failing");
+  const stable = reports.filter((r) => r.classification === "stable-pass");
+
+  const lines: string[] = [];
+  lines.push("");
+  const crashNote = crashedRuns > 0 ? `, ${crashedRuns} crashed` : "";
+  lines.push(`Sweep complete: ${usableRuns}/${totalRuns} runs usable${crashNote}.`);
+  lines.push(
+    `${reports.length} tests · ${flaky.length} flaky · ${failing.length} consistently-failing · ${stable.length} stable.`,
+  );
+
+  if (flaky.length > 0) {
+    lines.push("");
+    lines.push("⚠ Flaky anomalies (worst first):");
+    for (const r of flaky) {
+      lines.push(
+        `  • ${r.testId} — ${r.fails}/${r.runs} fails (${Math.round(r.flakeRate * 100)}%)`,
+      );
+    }
+  }
+  if (failing.length > 0) {
+    lines.push("");
+    lines.push("✗ Consistently failing (likely real bugs, not flakes):");
+    for (const r of failing) {
+      lines.push(`  • ${r.testId} — ${r.fails}/${r.runs} fails`);
+    }
+  }
+
+  process.stdout.write(`${lines.join("\n")}\n`);
 }

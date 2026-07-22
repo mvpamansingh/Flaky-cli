@@ -36,6 +36,8 @@ export interface RunResult {
   runnerExitCode: number;
   /** true = runner failed to produce usable results, NOT test failures. */
   crashed: boolean;
+  /** Human-readable reason this run was classified as crashed, if it was. */
+  crashReason?: string;
   timedOut: boolean;
 }
 
