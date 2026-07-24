@@ -1,20 +1,25 @@
 import { dirname, isAbsolute, resolve } from "node:path";
+import ora, { type Ora } from "ora";
 import { loadConfig } from "../config/load.js";
 import { correlate } from "../core/correlate.js";
 import { sweep } from "../core/sweep.js";
 import { getParser } from "../parsers/index.js";
-import type { FlakeReport, RunResult } from "../types.js";
+import { renderReport } from "../report/terminal.js";
+import type { RunResult } from "../types.js";
 import { formatDuration } from "../utils/timing.js";
+import { isInteractive } from "../utils/tty.js";
 
 /**
- * `flaky run` — the pipeline conductor.
+ * `flaky run` — the pipeline conductor. Orchestration only: it drives
+ * `core` (sweep → correlate) then hands the result to `report`; it holds no
+ * detection or rendering logic of its own (SPEC §11 dependency direction).
  *
- * PHASE 5 SCOPE: runs the command N times **sequentially** (rule #1), correlates
- * results across runs into `FlakeReport[]`, and prints a plain-text summary.
- * Phase 6 replaces that summary with the themed Xenolith table.
- *
- * Output discipline (rule #5, prep for `--json` in Phase 8): progress/logs go to
- * **stderr**; the final report is the tool's *result*, so it goes to **stdout**.
+ * Output discipline (rule #5, prep for `--json` in Phase 8): progress goes to
+ * **stderr** (an `ora` spinner on a TTY, plain lines when piped); the final
+ * report is the tool's *result*, so it goes to **stdout** (themed on a TTY,
+ * plain pipe-safe text otherwise). The two streams are gated independently via
+ * `isInteractive` because they can differ (e.g. `flaky run | cat` leaves stderr
+ * a TTY but stdout a pipe).
  */
 
 export interface RunOptions {
@@ -66,28 +71,42 @@ export async function runCommand(opts: RunOptions): Promise<void> {
   // resultsPath resolve relative to the project — not to our CLI's cwd.
   const cwd = dirname(absConfig);
 
+  // Progress → stderr. A live spinner on an interactive stderr (rule #5), plain
+  // lines when piped. `ora` writes to stderr so it never pollutes the stdout report.
+  const spinner: Ora | undefined = isInteractive(process.stderr)
+    ? ora({ stream: process.stderr, text: "⟁ Preparing specimen scan…" }).start()
+    : undefined;
+
   const runs = await sweep({
     config,
     parser,
     times,
     cwd,
     onRunStart: (i, total) => {
-      process.stderr.write(`⟁ Scanning specimen ${i}/${total} — ${config.command}\n`);
+      if (spinner) spinner.text = `⟁ Scanning specimen ${i}/${total}…`;
+      else process.stderr.write(`⟁ Scanning specimen ${i}/${total} — ${config.command}\n`);
     },
     onRunComplete: ({ runIndex, total, run, elapsedMs }) => {
-      process.stderr.write(`  ↳ ${describeRun(run)} — ${formatDuration(elapsedMs)}\n`);
+      // The per-run breakdown scrolls past on a TTY (the spinner already shows
+      // live progress), so only emit it when piped.
+      if (!spinner) {
+        process.stderr.write(`  ↳ ${describeRun(run)} — ${formatDuration(elapsedMs)}\n`);
+      }
 
       // First-run duration estimate + large-sweep warning (SPEC §6). Only worth
-      // it when more runs remain.
+      // it when more runs remain. Persist above the spinner (`.info`/`.warn`
+      // stop it and print a line), then resume the scan.
       if (runIndex === 1 && total > 1) {
         const projected = elapsedMs * total;
-        process.stderr.write(
-          `⟁ Estimated sweep time: ~${formatDuration(projected)} (${total} runs).\n`,
-        );
+        const est = `⟁ Estimated sweep time: ~${formatDuration(projected)} (${total} runs).`;
+        if (spinner) spinner.info(est).start();
+        else process.stderr.write(`${est}\n`);
+
         if (projected >= LARGE_SWEEP_MS) {
-          process.stderr.write(
-            "⚠ This is a long sweep. Press Ctrl-C to abort, or re-run with a smaller --times.\n",
-          );
+          const warn =
+            "⚠ This is a long sweep. Press Ctrl-C to abort, or re-run with a smaller --times.";
+          if (spinner) spinner.warn(warn).start();
+          else process.stderr.write(`${warn}\n`);
         }
       }
     },
@@ -101,15 +120,22 @@ export async function runCommand(opts: RunOptions): Promise<void> {
   if (usableRuns === 0) {
     const firstReason = runs.find((r) => r.crashReason)?.crashReason;
     const detail = firstReason ? ` First failure: ${firstReason}` : "";
-    process.stderr.write(
-      `✗ No usable runs — all ${runs.length} crashed. Nothing to report.${detail}\n`,
-    );
+    const msg = `✗ No usable runs — all ${runs.length} crashed. Nothing to report.${detail}`;
+    if (spinner) spinner.fail(msg);
+    else process.stderr.write(`${msg}\n`);
     process.exitCode = 1;
     return;
   }
 
+  spinner?.succeed(`⟁ Scan complete — ${usableRuns}/${runs.length} runs usable.`);
+
   const reports = correlate(runs);
-  renderSummary(reports, usableRuns, crashedRuns, runs.length);
+  const report = renderReport(
+    reports,
+    { usableRuns, crashedRuns, totalRuns: runs.length },
+    { color: isInteractive(process.stdout) },
+  );
+  process.stdout.write(report);
 }
 
 /** One-line description of a single run, for the progress stream (stderr). */
@@ -125,47 +151,4 @@ function describeRun(run: RunResult): string {
   }
   const timeout = run.timedOut ? " (timed out)" : "";
   return `exit ${run.runnerExitCode}${timeout}; ${run.results.length} tests (${pass} pass, ${fail} fail, ${skip} skip)`;
-}
-
-/**
- * Plain-text sweep summary → stdout (the tool's *result*). Phase 6 replaces this
- * with the themed `cli-table3` report; keeping it plain now means output is
- * already pipe-safe and stdout carries only the report.
- */
-function renderSummary(
-  reports: FlakeReport[],
-  usableRuns: number,
-  crashedRuns: number,
-  totalRuns: number,
-): void {
-  const flaky = reports.filter((r) => r.classification === "flaky");
-  const failing = reports.filter((r) => r.classification === "consistently-failing");
-  const stable = reports.filter((r) => r.classification === "stable-pass");
-
-  const lines: string[] = [];
-  lines.push("");
-  const crashNote = crashedRuns > 0 ? `, ${crashedRuns} crashed` : "";
-  lines.push(`Sweep complete: ${usableRuns}/${totalRuns} runs usable${crashNote}.`);
-  lines.push(
-    `${reports.length} tests · ${flaky.length} flaky · ${failing.length} consistently-failing · ${stable.length} stable.`,
-  );
-
-  if (flaky.length > 0) {
-    lines.push("");
-    lines.push("⚠ Flaky anomalies (worst first):");
-    for (const r of flaky) {
-      lines.push(
-        `  • ${r.testId} — ${r.fails}/${r.runs} fails (${Math.round(r.flakeRate * 100)}%)`,
-      );
-    }
-  }
-  if (failing.length > 0) {
-    lines.push("");
-    lines.push("✗ Consistently failing (likely real bugs, not flakes):");
-    for (const r of failing) {
-      lines.push(`  • ${r.testId} — ${r.fails}/${r.runs} fails`);
-    }
-  }
-
-  process.stdout.write(`${lines.join("\n")}\n`);
 }
