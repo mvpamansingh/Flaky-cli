@@ -23,12 +23,15 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "boxen": "^8.0.1",
     "chalk": "^5.4.1",
+    "cli-table3": "^0.6.5",
     "commander": "^13.1.0",
     "execa": "^9.6.1",
     "fast-xml-parser": "^5.10.1",
     "figlet": "^1.8.0",
     "gradient-string": "^3.0.0",
+    "ora": "^9.4.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
