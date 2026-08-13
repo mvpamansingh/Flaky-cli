@@ -27,9 +27,26 @@ program
   .description("Run the test suite repeatedly and detect flaky tests")
   .option("-c, --config <path>", "config location", "./flaky.config.json")
   .option("-n, --times <count>", "number of full-suite runs (overrides config)")
-  .action(async (opts: { config?: string; times?: string }) => {
-    await runCommand({ config: opts.config, times: opts.times });
-  });
+  .option("--isolate", "diagnose each flaky test by re-running it alone")
+  .option(
+    "--isolation-runs <count>",
+    "times to re-run each flaky test alone during isolation (overrides config)",
+  )
+  .action(
+    async (opts: {
+      config?: string;
+      times?: string;
+      isolate?: boolean;
+      isolationRuns?: string;
+    }) => {
+      await runCommand({
+        config: opts.config,
+        times: opts.times,
+        isolate: opts.isolate,
+        isolationRuns: opts.isolationRuns,
+      });
+    },
+  );
 
 program.action(() => {
   program.outputHelp();

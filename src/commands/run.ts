@@ -2,10 +2,11 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import ora, { type Ora } from "ora";
 import { loadConfig } from "../config/load.js";
 import { correlate } from "../core/correlate.js";
+import { type TestIdentity, isolate } from "../core/isolate.js";
 import { sweep } from "../core/sweep.js";
 import { getParser } from "../parsers/index.js";
 import { renderReport } from "../report/terminal.js";
-import type { RunResult } from "../types.js";
+import type { FlakeReport, RunResult } from "../types.js";
 import { formatDuration } from "../utils/timing.js";
 import { isInteractive } from "../utils/tty.js";
 
@@ -26,6 +27,10 @@ export interface RunOptions {
   config?: string;
   /** Raw `-n/--times` value from commander (string); parsed + validated here. */
   times?: string;
+  /** `--isolate` flag; when absent, falls back to `config.isolate`. */
+  isolate?: boolean;
+  /** Raw `--isolation-runs` value (string); parsed + validated here. */
+  isolationRuns?: string;
 }
 
 /** Projected sweep time at or above which we warn the user (SPEC §6). */
@@ -56,15 +61,27 @@ export async function runCommand(opts: RunOptions): Promise<void> {
   }
 
   // Resolve N: an explicit `-n/--times` overrides the config default.
-  let times = config.times;
-  if (opts.times !== undefined) {
-    const parsed = Number(opts.times);
-    if (!Number.isInteger(parsed) || parsed < 1) {
-      process.stderr.write(`✗ --times must be a positive integer (got "${opts.times}").\n`);
-      process.exitCode = 1;
-      return;
-    }
-    times = parsed;
+  const times = resolvePositiveInt(opts.times, config.times, "--times");
+  if (times === undefined) {
+    process.stderr.write(`✗ --times must be a positive integer (got "${opts.times}").\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  // Resolve isolation: `--isolate` flag overrides `config.isolate`; `-R` count
+  // overrides `config.isolationRuns`.
+  const isolateEnabled = opts.isolate ?? config.isolate;
+  const isolationRuns = resolvePositiveInt(
+    opts.isolationRuns,
+    config.isolationRuns,
+    "--isolation-runs",
+  );
+  if (isolationRuns === undefined) {
+    process.stderr.write(
+      `✗ --isolation-runs must be a positive integer (got "${opts.isolationRuns}").\n`,
+    );
+    process.exitCode = 1;
+    return;
   }
 
   // Run the command where the user's project lives, so its command and
@@ -130,12 +147,126 @@ export async function runCommand(opts: RunOptions): Promise<void> {
   spinner?.succeed(`⟁ Scan complete — ${usableRuns}/${runs.length} runs usable.`);
 
   const reports = correlate(runs);
+
+  // Isolation diagnosis (Phase 7): re-run each flaky test alone R times to tell
+  // an external cause (order / shared state) from an internal one (randomness /
+  // timing). Only the `flaky` rows are worth isolating.
+  if (isolateEnabled) {
+    await diagnoseFlaky(reports, runs, {
+      config,
+      parser,
+      cwd,
+      isolationRuns,
+      spinner,
+    });
+  }
+
   const report = renderReport(
     reports,
     { usableRuns, crashedRuns, totalRuns: runs.length },
     { color: isInteractive(process.stdout) },
   );
   process.stdout.write(report);
+}
+
+/**
+ * Parse an optional `--flag` override into a positive int, else the config
+ * default. Returns `undefined` when an override was given but is invalid (the
+ * caller prints the flag-specific error and exits).
+ */
+function resolvePositiveInt(
+  override: string | undefined,
+  fallback: number,
+  _flag: string,
+): number | undefined {
+  if (override === undefined) return fallback;
+  const parsed = Number(override);
+  if (!Number.isInteger(parsed) || parsed < 1) return undefined;
+  return parsed;
+}
+
+/**
+ * Run isolation diagnosis over the `flaky` reports and attach each `diagnosis`
+ * back onto its report (mutates `reports` in place). No-ops with a friendly
+ * stderr note when there's nothing to isolate or no `isolateCommand` configured
+ * — isolation is a bonus pass, never a hard failure.
+ */
+async function diagnoseFlaky(
+  reports: FlakeReport[],
+  runs: RunResult[],
+  ctx: {
+    config: Awaited<ReturnType<typeof loadConfig>>;
+    parser: ReturnType<typeof getParser>;
+    cwd: string;
+    isolationRuns: number;
+    spinner: Ora | undefined;
+  },
+): Promise<void> {
+  const { config, parser, cwd, isolationRuns, spinner } = ctx;
+  const flaky = reports.filter((r) => r.classification === "flaky");
+
+  const note = (msg: string) => {
+    if (spinner) spinner.info(msg);
+    else process.stderr.write(`${msg}\n`);
+  };
+
+  if (flaky.length === 0) {
+    note("⟁ No flaky anomalies to isolate.");
+    return;
+  }
+  if (!config.isolateCommand) {
+    note(
+      '⚠ --isolate needs an `isolateCommand` in your config (e.g. "npx vitest run {file} -t \\"{testNamePattern}\\""). Skipping diagnosis.',
+    );
+    return;
+  }
+
+  // Recover each flaky test's file + name from the sweep results (correlate only
+  // keeps the id). Match on file + name during isolation (SPEC §4).
+  const identities = buildIdentityMap(runs);
+  const targets: TestIdentity[] = [];
+  for (const r of flaky) {
+    const id = identities.get(r.testId);
+    if (id) targets.push(id);
+  }
+
+  if (spinner) spinner.start(`⟁ Isolating ${targets.length} anomalies…`);
+  else
+    process.stderr.write(`⟁ Isolating ${targets.length} anomalies (${isolationRuns} runs each)…\n`);
+
+  const isoResults = await isolate({
+    config,
+    parser,
+    targets,
+    isolationRuns,
+    cwd,
+    onProgress: ({ name, run, totalRuns, targetIndex, totalTargets }) => {
+      const text = `⟁ Isolating ${name} — run ${run}/${totalRuns} (${targetIndex}/${totalTargets})…`;
+      if (spinner) spinner.text = text;
+      else process.stderr.write(`  ↳ ${text}\n`);
+    },
+  });
+
+  const byId = new Map(isoResults.map((x) => [x.testId, x.diagnosis]));
+  for (const r of reports) {
+    const diagnosis = byId.get(r.testId);
+    if (diagnosis) r.diagnosis = diagnosis;
+  }
+
+  spinner?.succeed(
+    `⟁ Isolation complete — diagnosed ${targets.length} anomal${targets.length === 1 ? "y" : "ies"}.`,
+  );
+}
+
+/** Map each test's stable id → its file/name (first occurrence across all runs). */
+function buildIdentityMap(runs: RunResult[]): Map<string, TestIdentity> {
+  const map = new Map<string, TestIdentity>();
+  for (const run of runs) {
+    for (const t of run.results) {
+      if (!map.has(t.id)) map.set(t.id, { testId: t.id, file: t.file, name: t.name });
+    }
+  }
+  return map;
 }
 
 /** One-line description of a single run, for the progress stream (stderr). */

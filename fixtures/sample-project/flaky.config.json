@@ -6,5 +6,5 @@
   "timeoutMs": 300000,
   "isolate": false,
   "isolationRuns": 10,
-  "isolateCommand": "npx vitest run {file} -t \"{testName}\""
+  "isolateCommand": "npx vitest run {file} -t \"{testNamePattern}\" --outputFile.junit=\"{results}\""
 }

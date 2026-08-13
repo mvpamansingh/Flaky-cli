@@ -51,6 +51,11 @@ function pct(rate: number): number {
   return Math.round(rate * 100);
 }
 
+/** Plain `[diagnosis]` tag for the piped output; empty when not diagnosed. */
+function diagnosisTag(diagnosis: FlakeReport["diagnosis"]): string {
+  return diagnosis ? ` [${diagnosis}]` : "";
+}
+
 // ── Plain renderer (non-TTY / piped) ────────────────────────────────────────
 //
 // Preserves the exact pre-Phase-6 text so `flaky run | cat` / redirected output
@@ -71,7 +76,9 @@ function renderPlain(reports: FlakeReport[], meta: ReportMeta): string {
     lines.push("");
     lines.push("⚠ Flaky anomalies (worst first):");
     for (const r of flaky) {
-      lines.push(`  • ${r.testId} — ${r.fails}/${r.runs} fails (${pct(r.flakeRate)}%)`);
+      lines.push(
+        `  • ${r.testId} — ${r.fails}/${r.runs} fails (${pct(r.flakeRate)}%)${diagnosisTag(r.diagnosis)}`,
+      );
     }
   }
   if (failing.length > 0) {
@@ -117,27 +124,51 @@ function flakeBar(rate: number, width = 5): string {
   return `${"▓".repeat(filled)}${"░".repeat(width - filled)} ${pct(rate)}%`;
 }
 
+/** Themed diagnosis cell: short Xenolith label, colored by cause. */
+function diagnosisCell(diagnosis: FlakeReport["diagnosis"], dim: ChalkInstance): string {
+  switch (diagnosis) {
+    case "order-dependent":
+      // External cause — cyan, the "signal comes from elsewhere" color.
+      return chalk.hex(palette.brand)("⇄ ORDER");
+    case "internally-nondeterministic":
+      // Cause lives inside the test — amber, same family as the flaky verdict.
+      return chalk.hex(palette.flaky)("⚛ INTERNAL");
+    case "unknown":
+      return dim("? UNKNOWN");
+    default:
+      return dim("—"); // not diagnosed (isolation off, or not a flaky row)
+  }
+}
+
 function renderThemed(reports: FlakeReport[], meta: ReportMeta): string {
   const brand = chalk.hex(palette.brand);
   const dim = chalk.hex(palette.dim);
   const head = (label: string) => brand.bold(label);
 
+  // Only show the Diagnosis column when isolation actually ran (any report carries
+  // a diagnosis) — otherwise it'd be a column of "—" that just adds noise.
+  const showDiagnosis = reports.some((r) => r.diagnosis);
+
   const table = new Table({
-    head: [head("Verdict"), head("Specimen"), head("Runs"), head("Instability")],
+    head: showDiagnosis
+      ? [head("Verdict"), head("Specimen"), head("Runs"), head("Instability"), head("Diagnosis")]
+      : [head("Verdict"), head("Specimen"), head("Runs"), head("Instability")],
     // We inject our own truecolor via chalk, so disable cli-table3's own styling.
     style: { head: [], border: [] },
-    colWidths: [13, 50, 12, 16],
+    colWidths: showDiagnosis ? [13, 40, 11, 15, 15] : [13, 50, 12, 16],
     wordWrap: true,
   });
 
   for (const r of reports) {
     const paint = colorFor(r.classification);
-    table.push([
+    const row = [
       paint(verdictLabel(r.classification)),
       paint(r.testId),
       dim(`${r.passes}✓ ${r.fails}✗`),
       paint(flakeBar(r.flakeRate)),
-    ]);
+    ];
+    if (showDiagnosis) row.push(diagnosisCell(r.diagnosis, dim));
+    table.push(row);
   }
 
   const { flaky, failing, stable } = tally(reports);
@@ -160,5 +191,9 @@ function renderThemed(reports: FlakeReport[], meta: ReportMeta): string {
     titleAlignment: "center",
   });
 
-  return `\n${box}\n\n${table.toString()}\n`;
+  const legend = showDiagnosis
+    ? `\n${dim("⇄ ORDER = fails only alongside other tests (shared state / ordering)  ·  ⚛ INTERNAL = fails on its own (randomness / timing)")}\n`
+    : "";
+
+  return `\n${box}\n\n${table.toString()}\n${legend}`;
 }
