@@ -5,8 +5,13 @@ import { correlate } from "../core/correlate.js";
 import { type TestIdentity, isolate } from "../core/isolate.js";
 import { sweep } from "../core/sweep.js";
 import { getParser } from "../parsers/index.js";
+import { renderHtml } from "../report/html.js";
+import { renderJson } from "../report/json.js";
+import { htmlFallbackPath, writePdfReport } from "../report/pdf.js";
 import { renderReport } from "../report/terminal.js";
+import type { ExportMeta } from "../report/types.js";
 import type { FlakeReport, RunResult } from "../types.js";
+import { writeOutputFile } from "../utils/outfile.js";
 import { formatDuration } from "../utils/timing.js";
 import { isInteractive } from "../utils/tty.js";
 
@@ -15,12 +20,17 @@ import { isInteractive } from "../utils/tty.js";
  * `core` (sweep → correlate) then hands the result to `report`; it holds no
  * detection or rendering logic of its own (SPEC §11 dependency direction).
  *
- * Output discipline (rule #5, prep for `--json` in Phase 8): progress goes to
- * **stderr** (an `ora` spinner on a TTY, plain lines when piped); the final
- * report is the tool's *result*, so it goes to **stdout** (themed on a TTY,
- * plain pipe-safe text otherwise). The two streams are gated independently via
- * `isInteractive` because they can differ (e.g. `flaky run | cat` leaves stderr
- * a TTY but stdout a pipe).
+ * Output discipline (rule #5): progress goes to **stderr** (an `ora` spinner on a
+ * TTY, plain lines when piped); the final report is the tool's *result*, so it goes
+ * to **stdout** (themed on a TTY, plain pipe-safe text otherwise). The two streams
+ * are gated independently via `isInteractive` because they can differ (e.g.
+ * `flaky run | cat` leaves stderr a TTY but stdout a pipe).
+ *
+ * `--json` (Phase 8) tightens that contract: stdout carries NOTHING but the JSON
+ * envelope, the spinner is suppressed outright (a spinner writing to stderr is
+ * still ANSI noise a CI log doesn't want), and every human-facing line — progress,
+ * export notices, warnings — goes to stderr. Export flags (`--html`/`--pdf`) write
+ * files and announce themselves on stderr too, never on stdout.
  */
 
 export interface RunOptions {
@@ -31,12 +41,23 @@ export interface RunOptions {
   isolate?: boolean;
   /** Raw `--isolation-runs` value (string); parsed + validated here. */
   isolationRuns?: string;
+  /** `--json`: stdout becomes a pure JSON envelope; all logs → stderr (rule #5). */
+  json?: boolean;
+  /** `--html [path]`: `true` = default filename, string = explicit path. */
+  html?: string | boolean;
+  /** `--pdf [path]`: `true` = default filename, string = explicit path. */
+  pdf?: string | boolean;
 }
 
 /** Projected sweep time at or above which we warn the user (SPEC §6). */
 const LARGE_SWEEP_MS = 5 * 60_000;
 
+/** Filenames used when `--html`/`--pdf` are passed without a path. */
+const DEFAULT_HTML_NAME = "flaky-report.html";
+const DEFAULT_PDF_NAME = "flaky-report.pdf";
+
 export async function runCommand(opts: RunOptions): Promise<void> {
+  const json = opts.json === true;
   const configPath = opts.config ?? "./flaky.config.json";
   const absConfig = isAbsolute(configPath) ? configPath : resolve(process.cwd(), configPath);
 
@@ -84,15 +105,29 @@ export async function runCommand(opts: RunOptions): Promise<void> {
     return;
   }
 
+  // Resolve export destinations BEFORE the sweep: a bad path should fail in
+  // milliseconds, not after twenty runs of someone's integration suite.
+  const htmlTarget = resolveExportPath(opts.html, DEFAULT_HTML_NAME, "--html");
+  const pdfTarget = resolveExportPath(opts.pdf, DEFAULT_PDF_NAME, "--pdf");
+  const pathError = htmlTarget.error ?? pdfTarget.error;
+  if (pathError) {
+    process.stderr.write(`${pathError}\n`);
+    process.exitCode = 1;
+    return;
+  }
+
   // Run the command where the user's project lives, so its command and
   // resultsPath resolve relative to the project — not to our CLI's cwd.
   const cwd = dirname(absConfig);
 
   // Progress → stderr. A live spinner on an interactive stderr (rule #5), plain
   // lines when piped. `ora` writes to stderr so it never pollutes the stdout report.
-  const spinner: Ora | undefined = isInteractive(process.stderr)
-    ? ora({ stream: process.stderr, text: "⟁ Preparing specimen scan…" }).start()
-    : undefined;
+  // `--json` suppresses the spinner entirely (rule #5 names `--json` alongside
+  // piping) — progress falls back to the plain stderr lines below.
+  const spinner: Ora | undefined =
+    !json && isInteractive(process.stderr)
+      ? ora({ stream: process.stderr, text: "⟁ Preparing specimen scan…" }).start()
+      : undefined;
 
   const runs = await sweep({
     config,
@@ -144,7 +179,9 @@ export async function runCommand(opts: RunOptions): Promise<void> {
     return;
   }
 
-  spinner?.succeed(`⟁ Scan complete — ${usableRuns}/${runs.length} runs usable.`);
+  const complete = `⟁ Scan complete — ${usableRuns}/${runs.length} runs usable.`;
+  if (spinner) spinner.succeed(complete);
+  else process.stderr.write(`${complete}\n`);
 
   const reports = correlate(runs);
 
@@ -161,12 +198,128 @@ export async function runCommand(opts: RunOptions): Promise<void> {
     });
   }
 
-  const report = renderReport(
-    reports,
-    { usableRuns, crashedRuns, totalRuns: runs.length },
-    { color: isInteractive(process.stdout) },
+  // One meta object frames every renderer. The terminal only reads the run counts;
+  // the file/machine exports also carry provenance, because they get read later and
+  // elsewhere by someone who never saw this session.
+  const meta: ExportMeta = {
+    usableRuns,
+    crashedRuns,
+    totalRuns: runs.length,
+    generatedAt: new Date().toISOString(),
+    command: config.command,
+    times,
+    isolation: { enabled: isolateEnabled, runs: isolationRuns },
+    crashes: runs
+      .filter((r) => r.crashed)
+      .map((r) => ({ runIndex: r.runIndex, reason: r.crashReason, timedOut: r.timedOut })),
+  };
+
+  // stdout carries exactly one thing: the report. Under `--json` that's the JSON
+  // envelope and nothing else — no banner, no colors, no log lines (rule #5).
+  process.stdout.write(
+    json
+      ? renderJson(reports, meta)
+      : renderReport(reports, meta, { color: isInteractive(process.stdout) }),
   );
-  process.stdout.write(report);
+
+  // File exports come last, so the primary result is already delivered even if an
+  // export fails. Notices go to stderr to keep `--json` stdout pure.
+  const exportsOk = await writeExports(reports, meta, {
+    htmlPath: htmlTarget.path,
+    pdfPath: pdfTarget.path,
+  });
+  if (!exportsOk) process.exitCode = 1;
+}
+
+/**
+ * Render + write the requested file exports.
+ *
+ * Returns false when a *requested* export could not be produced (bad path, puppeteer
+ * crash) so the caller can exit non-zero — the user asked for a file and didn't get
+ * one. A missing puppeteer is deliberately NOT a failure: SPEC §8 defines that as
+ * graceful degradation (hint + HTML instead), so it returns true.
+ *
+ * Every notice goes to stderr with plain `write` calls: by this point the sweep and
+ * isolation spinners have been stopped (`.succeed`/`.fail`), so there is no live
+ * spinner line left to corrupt.
+ */
+async function writeExports(
+  reports: FlakeReport[],
+  meta: ExportMeta,
+  targets: { htmlPath?: string; pdfPath?: string },
+): Promise<boolean> {
+  const { htmlPath, pdfPath } = targets;
+  if (!htmlPath && !pdfPath) return true;
+
+  // One render feeds both flags — the PDF is literally this HTML through Chromium.
+  const html = renderHtml(reports, meta);
+  let ok = true;
+
+  if (htmlPath) {
+    try {
+      await writeOutputFile(htmlPath, html);
+      process.stderr.write(`⟁ HTML report written to ${htmlPath}\n`);
+    } catch (err) {
+      process.stderr.write(`✗ Could not write HTML report to ${htmlPath}: ${asMessage(err)}\n`);
+      ok = false;
+    }
+  }
+
+  if (pdfPath) {
+    process.stderr.write("⟁ Rendering PDF via puppeteer…\n");
+    const result = await writePdfReport({ html, path: pdfPath });
+
+    if (result.ok) {
+      process.stderr.write(`⟁ PDF report written to ${pdfPath}\n`);
+    } else if (result.reason === "puppeteer-missing") {
+      // SPEC §8: friendly hint, and still produce the HTML.
+      process.stderr.write(`⚠ ${result.message}\n`);
+      if (htmlPath) {
+        process.stderr.write(`  ↳ The HTML report is at ${htmlPath}.\n`);
+      } else {
+        const fallback = htmlFallbackPath(pdfPath);
+        try {
+          await writeOutputFile(fallback, html);
+          process.stderr.write(`  ↳ Wrote the HTML report instead: ${fallback}\n`);
+        } catch (err) {
+          process.stderr.write(`✗ Could not write HTML report to ${fallback}: ${asMessage(err)}\n`);
+          ok = false;
+        }
+      }
+    } else {
+      process.stderr.write(`✗ PDF export failed: ${result.message}\n`);
+      ok = false;
+    }
+  }
+
+  return ok;
+}
+
+/**
+ * Resolve an optional-value export flag into an absolute path.
+ *
+ * Commander gives `undefined` (flag absent), `true` (bare flag → use the default
+ * filename), or a string (explicit path). Paths resolve against **`process.cwd()`**,
+ * the directory the user typed the command in — deliberately NOT the config directory
+ * (which is the *child test command's* cwd), because `--html ./report.html` should
+ * land where the user is looking.
+ */
+function resolveExportPath(
+  value: string | boolean | undefined,
+  defaultName: string,
+  flag: string,
+): { path?: string; error?: string } {
+  if (value === undefined || value === false) return {};
+  if (value === true) return { path: resolve(process.cwd(), defaultName) };
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    return { error: `✗ ${flag} needs a file path, or pass it bare to use ./${defaultName}.` };
+  }
+  return { path: resolve(process.cwd(), trimmed) };
+}
+
+function asMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /**
