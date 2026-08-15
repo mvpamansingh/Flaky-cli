@@ -4,6 +4,7 @@ import { isAbsolute, resolve } from "node:path";
 import { execa } from "execa";
 import type { Config } from "../config/schema.js";
 import type { RawRun } from "../types.js";
+import { onInterrupt } from "../utils/interrupt.js";
 import { toPosix, uniqueResultsPath } from "../utils/tempfile.js";
 
 /**
@@ -25,6 +26,28 @@ const RESULTS_PLACEHOLDER = "{results}";
 
 /** After a timeout SIGTERM, wait this long before escalating to SIGKILL (POSIX). */
 const FORCE_KILL_DELAY_MS = 5_000;
+
+/**
+ * Pids of test-command trees we currently own, so an aborting process can take them
+ * with it (Phase 9). Only one entry exists at a time in practice — rule #1 makes runs
+ * sequential — but a Set costs nothing and doesn't assume that.
+ */
+const activePids = new Set<number>();
+
+/**
+ * Tree-kill every run still in flight. Registered as the Ctrl-C cleanup: on POSIX our
+ * children are `detached` (their own process group) specifically so the timeout can
+ * tree-kill them, which also means the terminal's Ctrl-C never reaches them — without
+ * this, aborting a sweep would leave the user's whole test suite running.
+ */
+export function killActiveRuns(): void {
+  for (const pid of activePids) killTree(pid, "SIGTERM");
+  activePids.clear();
+}
+
+// Registered once at module load, not per run: `onInterrupt` is idempotent-by-identity
+// (a Set), and the function reads `activePids` live, so there's nothing to re-register.
+onInterrupt(killActiveRuns);
 
 export interface RunOnceOptions {
   config: Config;
@@ -84,6 +107,7 @@ export async function runOnce({
       env: { ...process.env, FLAKY_RESULTS_PATH: toPosix(expectedFile) },
     });
     const pid = subprocess.pid;
+    if (pid !== undefined) activePids.add(pid);
 
     // Rule #3: per-run timeout with a TREE kill. execa's built-in `timeout` only
     // kills the direct child (the shell); its descendants survive, keep the
@@ -95,19 +119,11 @@ export async function runOnce({
     const killTimer = setTimeout(() => {
       timedOut = true;
       if (pid === undefined) return;
-      if (isWindows) {
-        // No signalable process group on Windows; taskkill /T walks the tree and
-        // /F forces termination. Fire-and-forget — we don't await the reaper.
-        spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" }).on(
-          "error",
-          () => {},
-        );
-      } else {
-        // `detached` made `pid` a process-group leader; a negative pid signals
-        // the whole group. SIGTERM first, then SIGKILL as a backstop for a tree
-        // that ignores SIGTERM.
-        killGroup(pid, "SIGTERM");
-        forceKillTimer = setTimeout(() => killGroup(pid, "SIGKILL"), FORCE_KILL_DELAY_MS);
+      killTree(pid, "SIGTERM");
+      if (!isWindows) {
+        // SIGKILL backstop for a POSIX tree that ignores SIGTERM. (Windows needs
+        // none: `killTree` there is already `taskkill /F`.)
+        forceKillTimer = setTimeout(() => killTree(pid, "SIGKILL"), FORCE_KILL_DELAY_MS);
         forceKillTimer.unref();
       }
     }, config.timeoutMs);
@@ -118,6 +134,7 @@ export async function runOnce({
     } finally {
       clearTimeout(killTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (pid !== undefined) activePids.delete(pid);
     }
   } catch (err) {
     // With reject:false, execa doesn't throw on non-zero exit — reaching here
@@ -177,8 +194,20 @@ export async function runOnce({
   }
 }
 
-/** Signal an entire POSIX process group (negative pid). No-op if already gone. */
-function killGroup(pid: number, signal: NodeJS.Signals): void {
+/**
+ * Kill a spawned run and everything it spawned. One helper for both callers (rule #3's
+ * timeout and Ctrl-C), because "kill the whole tree, not just the shell" is the same
+ * hard-won requirement in both cases — the Decisions log records a 500ms timeout that
+ * still took 10s because only the direct child was killed.
+ */
+function killTree(pid: number, signal: NodeJS.Signals): void {
+  if (process.platform === "win32") {
+    // No signalable process group on Windows; taskkill /T walks the tree and /F
+    // forces termination. Fire-and-forget — we don't await the reaper.
+    spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" }).on("error", () => {});
+    return;
+  }
+  // `detached` made `pid` a process-group leader; a negative pid signals the group.
   try {
     process.kill(-pid, signal);
   } catch {
