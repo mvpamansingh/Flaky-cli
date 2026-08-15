@@ -11,6 +11,7 @@ import { htmlFallbackPath, writePdfReport } from "../report/pdf.js";
 import { renderReport } from "../report/terminal.js";
 import type { ExportMeta } from "../report/types.js";
 import type { FlakeReport, RunResult } from "../types.js";
+import { onInterrupt } from "../utils/interrupt.js";
 import { writeOutputFile } from "../utils/outfile.js";
 import { formatDuration } from "../utils/timing.js";
 import { isInteractive } from "../utils/tty.js";
@@ -37,7 +38,10 @@ export interface RunOptions {
   config?: string;
   /** Raw `-n/--times` value from commander (string); parsed + validated here. */
   times?: string;
-  /** `--isolate` flag; when absent, falls back to `config.isolate`. */
+  /**
+   * Tri-state isolation switch: `true` = `--isolate`, `false` = `--no-isolate`,
+   * `undefined` = neither flag given → fall back to `config.isolate`.
+   */
   isolate?: boolean;
   /** Raw `--isolation-runs` value (string); parsed + validated here. */
   isolationRuns?: string;
@@ -89,9 +93,10 @@ export async function runCommand(opts: RunOptions): Promise<void> {
     return;
   }
 
-  // Resolve isolation: `--isolate` flag overrides `config.isolate`; `-R` count
-  // overrides `config.isolationRuns`.
-  const isolateEnabled = opts.isolate ?? config.isolate;
+  // Resolve isolation. `??` (not `||`) is what makes the escape hatch work:
+  // `--no-isolate` gives `false`, which must beat a config `"isolate": true`,
+  // while "neither flag passed" is `undefined` and defers to the config.
+  const isolateEnabled = resolveIsolate(opts.isolate, config.isolate);
   const isolationRuns = resolvePositiveInt(
     opts.isolationRuns,
     config.isolationRuns,
@@ -128,6 +133,12 @@ export async function runCommand(opts: RunOptions): Promise<void> {
     !json && isInteractive(process.stderr)
       ? ora({ stream: process.stderr, text: "⟁ Preparing specimen scan…" }).start()
       : undefined;
+
+  // Ctrl-C mid-sweep must not leave a half-drawn spinner and a hidden cursor behind
+  // (`ora` hides it while spinning). `core/runner.ts` registers the matching cleanup
+  // for the spawned test process itself. Nothing to unregister: the registry is only
+  // ever drained by a signal, and a normal finish exits the process.
+  if (spinner) onInterrupt(() => spinner.stop());
 
   const runs = await sweep({
     config,
@@ -320,6 +331,20 @@ function resolveExportPath(
 
 function asMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Resolve the tri-state isolation switch (Phase 9 escape hatch).
+ *
+ * Commander gives `true` for `--isolate`, `false` for `--no-isolate`, and
+ * `undefined` when neither appears — so an explicit flag always wins and only a
+ * *silent* CLI defers to the config. Exported for direct unit testing: the
+ * `undefined` case is the fragile one (it depends on commander declaring
+ * `--isolate` before `--no-isolate` in `cli.ts`), and a regression there would
+ * quietly run — or quietly skip — a diagnosis pass.
+ */
+export function resolveIsolate(flag: boolean | undefined, fromConfig: boolean): boolean {
+  return flag ?? fromConfig;
 }
 
 /**
