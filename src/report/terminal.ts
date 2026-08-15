@@ -3,6 +3,7 @@ import chalk, { type ChalkInstance } from "chalk";
 import Table from "cli-table3";
 import { palette } from "../theme/palette.js";
 import type { FlakeReport } from "../types.js";
+import type { ReportMeta } from "./types.js";
 
 /**
  * Themed terminal report (SPEC §7, Xenolith). Presentation only — it consumes the
@@ -11,17 +12,17 @@ import type { FlakeReport } from "../types.js";
  * returned string to stdout (the report is the tool's *result*, rule #5 / SPEC §5).
  *
  * `color` gates all ANSI/box output (CLAUDE.md rule #5). The caller decides it from
- * `isInteractive(process.stdout)`; when false we return the plain, pipe-safe text —
- * byte-for-byte the format `flaky run` emitted before Phase 6, so pipes and `--json`
- * prep are unaffected.
+ * `isInteractive(process.stdout)`; when false we return plain, ANSI-free, pipe-safe
+ * text. That plain form was byte-identical to the pre-Phase-6 output until Phase 9
+ * appended the sampling caveat — the one deliberate break, because CLAUDE.md requires
+ * the honesty note in the UI and a piped report is exactly the copy that gets pasted
+ * into a ticket without its context.
  */
 
-/** Sweep-level counts that frame the report (not per-test). */
-export interface ReportMeta {
-  usableRuns: number;
-  crashedRuns: number;
-  totalRuns: number;
-}
+// `ReportMeta` now lives in `report/types.ts` (shared with the html/json exports,
+// which extend it into `ExportMeta`). Re-exported here so existing importers — and
+// the mental model "the terminal renderer takes reports + meta" — stay intact.
+export type { ReportMeta };
 
 export function renderReport(
   reports: FlakeReport[],
@@ -49,6 +50,25 @@ function tally(reports: FlakeReport[]): Counts {
 
 function pct(rate: number): number {
   return Math.round(rate * 100);
+}
+
+/**
+ * The sampling caveat (CLAUDE.md: "We can only *sample* flakiness, never prove its
+ * absence… Say so honestly in the UI").
+ *
+ * ONE sentence shared by both renderers so the plain and themed views can never
+ * disagree about how strong a claim we're making — the same reason the HTML export
+ * builds its longer note from the same facts. It quotes `usableRuns` rather than the
+ * requested N because that is the sample the numbers above it actually came from: a
+ * sweep where 18 of 20 runs crashed makes a much weaker statement than one where none
+ * did, and the reader deserves the honest denominator.
+ *
+ * Deliberately contains no `[` — the plain renderer's `[diagnosis]` tags are asserted
+ * by absence in tests/terminal.test.ts, and a bracket here would make that test lie.
+ */
+function samplingCaveat(meta: ReportMeta): string {
+  const runs = `${meta.usableRuns} run${meta.usableRuns === 1 ? "" : "s"}`;
+  return `Note: this is a sample, not a proof — based on ${runs}. A test called stable here can still flake below this sweep's resolution; raise --times to tighten the bound.`;
 }
 
 /** Plain `[diagnosis]` tag for the piped output; empty when not diagnosed. */
@@ -88,6 +108,11 @@ function renderPlain(reports: FlakeReport[], meta: ReportMeta): string {
       lines.push(`  • ${r.testId} — ${r.fails}/${r.runs} fails`);
     }
   }
+
+  // Footnote position, deliberately: it's the last thing before the prompt, so it
+  // can't be scrolled past unread the way a header can.
+  lines.push("");
+  lines.push(samplingCaveat(meta));
 
   return `${lines.join("\n")}\n`;
 }
@@ -195,5 +220,9 @@ function renderThemed(reports: FlakeReport[], meta: ReportMeta): string {
     ? `\n${dim("⇄ ORDER = fails only alongside other tests (shared state / ordering)  ·  ⚛ INTERNAL = fails on its own (randomness / timing)")}\n`
     : "";
 
-  return `\n${box}\n\n${table.toString()}\n${legend}`;
+  // Dim, not amber: the caveat frames the whole report, so it must not compete with
+  // the status colors that carry the actual findings.
+  const caveat = dim(samplingCaveat(meta));
+
+  return `\n${box}\n\n${table.toString()}\n${legend}\n${caveat}\n`;
 }

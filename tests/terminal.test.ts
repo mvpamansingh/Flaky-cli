@@ -163,3 +163,48 @@ describe("renderReport — isolation diagnosis (Phase 7)", () => {
     expect(out).not.toContain("Diagnosis");
   });
 });
+
+describe("renderReport — sampling caveat (Phase 9)", () => {
+  // CLAUDE.md: "We can only *sample* flakiness, never prove its absence… Say so
+  // honestly in the UI." Both views must carry it, and both must quote the run count
+  // the numbers actually came from.
+  it("plain: states the sample honestly and points at --times", () => {
+    const out = renderReport(reports, meta, { color: false });
+    expect(out).toContain("this is a sample, not a proof — based on 10 runs");
+    expect(out).toContain("raise --times to tighten the bound");
+  });
+
+  it("themed: carries the same caveat", () => {
+    const out = renderReport(reports, meta, { color: true });
+    expect(out).toContain("this is a sample, not a proof");
+    expect(out).toContain("raise --times to tighten the bound");
+  });
+
+  it("quotes USABLE runs, not the total — a crashed sweep makes a weaker claim", () => {
+    const out = renderReport(
+      reports,
+      { usableRuns: 2, crashedRuns: 18, totalRuns: 20 },
+      {
+        color: false,
+      },
+    );
+    expect(out).toContain("based on 2 runs");
+    expect(out).not.toContain("based on 20 runs");
+  });
+
+  it("says '1 run', not '1 runs'", () => {
+    const out = renderReport(
+      reports,
+      { usableRuns: 1, crashedRuns: 0, totalRuns: 1 },
+      {
+        color: false,
+      },
+    );
+    expect(out).toContain("based on 1 run.");
+  });
+
+  it("stays ANSI-free in the plain view", () => {
+    const out = renderReport(reports, meta, { color: false });
+    expect(out.includes(ESC)).toBe(false);
+  });
+});
