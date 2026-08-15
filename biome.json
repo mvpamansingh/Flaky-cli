@@ -6,7 +6,7 @@
     "useIgnoreFile": true
   },
   "files": {
-    "ignore": ["dist", "node_modules", "fixtures"]
+    "ignore": ["dist", "node_modules", "fixtures", ".claude", ".idea", "tmp"]
   },
   "organizeImports": {
     "enabled": true

@@ -56,7 +56,7 @@ describe("buildJsonReport", () => {
 
   it("stamps the schema version and the tool identity", () => {
     expect(envelope.schemaVersion).toBe(JSON_SCHEMA_VERSION);
-    expect(envelope.tool.name).toBe("flaky-detective");
+    expect(envelope.tool.name).toBe("flaky-test-detective");
     expect(typeof envelope.tool.version).toBe("string");
   });
 

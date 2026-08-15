@@ -2,3 +2,11 @@ node_modules/
 dist/
 *.log
 .DS_Store
+
+# Scratch output from live/manual verification runs (exports, captured streams).
+tmp/
+
+# Editor / tooling state.
+.idea/
+.vscode/
+.claude/settings.local.json

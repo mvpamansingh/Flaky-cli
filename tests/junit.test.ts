@@ -1,16 +1,18 @@
 /**
- * MANUAL / eyeball harness for the Phase 4 parser + registry.
+ * Table-driven tests for the Phase 4 parser (`junitParser.parse`, A-series) and the
+ * reporter registry (`getParser`, B-series).
  *
- * This is a human-readable verification of `junitParser.parse` (A-series) and
- * `getParser` (B-series). Each case prints ACTUAL vs EXPECTED and asserts they
- * match, so `npm test` shows one PASS/FAIL line per vector.
+ * Started life as a manual eyeball harness that printed ACTUAL vs EXPECTED for every
+ * vector; Phase 9 dropped the printing (vitest already shows a diff on failure, and
+ * the logs drowned out the rest of `npm test`) and renamed the file from
+ * `junit.manual.test.ts`, since the assertions had long since made it automatic.
+ * The vector table is the valuable part and is unchanged.
  *
- * Run just this file:   npx vitest run tests/junit.manual.test.ts
- * Or watch it:          npx vitest tests/junit.manual.test.ts
+ * Run just this file: `npx vitest run tests/junit.test.ts`
  */
 import { describe, expect, it } from "vitest";
-import { junitParser } from "../src/parsers/junit.js";
 import { getParser } from "../src/parsers/index.js";
+import { junitParser } from "../src/parsers/junit.js";
 import type { TestResult } from "../src/types.js";
 
 // --- A-series: junitParser.parse(xml) -> TestResult[] ------------------------
@@ -39,9 +41,27 @@ const A: Vector[] = [
   </testsuite>
 </testsuites>`,
     expected: [
-      { id: "tests/random.test.ts :: random passes", file: "tests/random.test.ts", name: "random passes", status: "pass", durationMs: 12 },
-      { id: "tests/random.test.ts :: random flakes", file: "tests/random.test.ts", name: "random flakes", status: "fail", durationMs: 5 },
-      { id: "tests/time.test.ts :: time check", file: "tests/time.test.ts", name: "time check", status: "pass", durationMs: 1500 },
+      {
+        id: "tests/random.test.ts :: random passes",
+        file: "tests/random.test.ts",
+        name: "random passes",
+        status: "pass",
+        durationMs: 12,
+      },
+      {
+        id: "tests/random.test.ts :: random flakes",
+        file: "tests/random.test.ts",
+        name: "random flakes",
+        status: "fail",
+        durationMs: 5,
+      },
+      {
+        id: "tests/time.test.ts :: time check",
+        file: "tests/time.test.ts",
+        name: "time check",
+        status: "pass",
+        durationMs: 1500,
+      },
     ],
   },
   {
@@ -55,8 +75,20 @@ const A: Vector[] = [
   </testcase>
 </testsuite>`,
     expected: [
-      { id: "test_math.py :: test_add", file: "test_math.py", name: "test_add", status: "pass", durationMs: 1 },
-      { id: "test_math.py :: test_divide", file: "test_math.py", name: "test_divide", status: "fail", durationMs: 2 },
+      {
+        id: "test_math.py :: test_add",
+        file: "test_math.py",
+        name: "test_add",
+        status: "pass",
+        durationMs: 1,
+      },
+      {
+        id: "test_math.py :: test_divide",
+        file: "test_math.py",
+        name: "test_divide",
+        status: "fail",
+        durationMs: 2,
+      },
     ],
   },
   {
@@ -68,7 +100,13 @@ const A: Vector[] = [
   </testsuite>
 </testsuites>`,
     expected: [
-      { id: "solo.test.ts :: only test", file: "solo.test.ts", name: "only test", status: "pass", durationMs: 100 },
+      {
+        id: "solo.test.ts :: only test",
+        file: "solo.test.ts",
+        name: "only test",
+        status: "pass",
+        durationMs: 100,
+      },
     ],
   },
   {
@@ -78,7 +116,13 @@ const A: Vector[] = [
   <testcase classname="skip.test.ts" name="skipped one" time="0"><skipped/></testcase>
 </testsuite>`,
     expected: [
-      { id: "skip.test.ts :: skipped one", file: "skip.test.ts", name: "skipped one", status: "skip", durationMs: 0 },
+      {
+        id: "skip.test.ts :: skipped one",
+        file: "skip.test.ts",
+        name: "skipped one",
+        status: "skip",
+        durationMs: 0,
+      },
     ],
   },
   {
@@ -88,7 +132,13 @@ const A: Vector[] = [
   <testcase classname="err.test.ts" name="throws" time="0.02"><error message="TypeError">stack</error></testcase>
 </testsuite>`,
     expected: [
-      { id: "err.test.ts :: throws", file: "err.test.ts", name: "throws", status: "fail", durationMs: 20 },
+      {
+        id: "err.test.ts :: throws",
+        file: "err.test.ts",
+        name: "throws",
+        status: "fail",
+        durationMs: 20,
+      },
     ],
   },
   {
@@ -98,7 +148,12 @@ const A: Vector[] = [
   <testcase classname="notime.test.ts" name="no timing"/>
 </testsuite>`,
     expected: [
-      { id: "notime.test.ts :: no timing", file: "notime.test.ts", name: "no timing", status: "pass" },
+      {
+        id: "notime.test.ts :: no timing",
+        file: "notime.test.ts",
+        name: "no timing",
+        status: "pass",
+      },
     ],
   },
   {
@@ -108,7 +163,13 @@ const A: Vector[] = [
   <testcase name="no classname" time="0.003"/>
 </testsuite>`,
     expected: [
-      { id: "fallback.test.ts :: no classname", file: "fallback.test.ts", name: "no classname", status: "pass", durationMs: 3 },
+      {
+        id: "fallback.test.ts :: no classname",
+        file: "fallback.test.ts",
+        name: "no classname",
+        status: "pass",
+        durationMs: 3,
+      },
     ],
   },
   {
@@ -118,7 +179,13 @@ const A: Vector[] = [
   <testcase classname="numeric.test.ts" name="0.30" time="0.01"/>
 </testsuite>`,
     expected: [
-      { id: "numeric.test.ts :: 0.30", file: "numeric.test.ts", name: "0.30", status: "pass", durationMs: 10 },
+      {
+        id: "numeric.test.ts :: 0.30",
+        file: "numeric.test.ts",
+        name: "0.30",
+        status: "pass",
+        durationMs: 10,
+      },
     ],
   },
   {
@@ -130,7 +197,13 @@ const A: Vector[] = [
   </testsuite>
 </testsuites>`,
     expected: [
-      { id: "(unknown file) :: (unnamed test)", file: "(unknown file)", name: "(unnamed test)", status: "pass", durationMs: 1 },
+      {
+        id: "(unknown file) :: (unnamed test)",
+        file: "(unknown file)",
+        name: "(unnamed test)",
+        status: "pass",
+        durationMs: 1,
+      },
     ],
   },
   {
@@ -140,13 +213,18 @@ const A: Vector[] = [
   <testcase classname="badtime.test.ts" name="nan time" time="abc"/>
 </testsuite>`,
     expected: [
-      { id: "badtime.test.ts :: nan time", file: "badtime.test.ts", name: "nan time", status: "pass" },
+      {
+        id: "badtime.test.ts :: nan time",
+        file: "badtime.test.ts",
+        name: "nan time",
+        status: "pass",
+      },
     ],
   },
   {
     id: "A11",
     what: "empty <testsuites> -> [] (valid, not a throw)",
-    xml: `<testsuites></testsuites>`,
+    xml: "<testsuites></testsuites>",
     expected: [],
   },
   {
@@ -160,26 +238,16 @@ const A: Vector[] = [
 describe("A-series: junitParser.parse", () => {
   for (const v of A) {
     it(`${v.id} — ${v.what}`, () => {
-      const actual = junitParser.parse(v.xml);
-      // Print so a human can eyeball ACTUAL vs EXPECTED even on a pass.
-      console.log(
-        `\n[${v.id}] ${v.what}\n  ACTUAL  : ${JSON.stringify(actual)}\n  EXPECTED: ${JSON.stringify(v.expected)}`,
-      );
-      expect(actual).toEqual(v.expected);
+      expect(junitParser.parse(v.xml)).toEqual(v.expected);
     });
   }
 
   it("A13 — malformed XML throws 'Invalid JUnit XML: ...'", () => {
-    const bad = `<testsuites><testsuite name="x"></testsuites>`;
-    let threw: Error | undefined;
-    try {
-      junitParser.parse(bad);
-    } catch (e) {
-      threw = e as Error;
-    }
-    console.log(`\n[A13] malformed input\n  THREW   : ${threw ? threw.message : "(did NOT throw)"}`);
-    expect(threw).toBeInstanceOf(Error);
-    expect(threw?.message).toMatch(/^Invalid JUnit XML:/);
+    // Load-bearing (rule #2): fast-xml-parser's `parse` is lenient and would return
+    // an object for this, which the sweep would read as "parsed fine, 0 tests" — a
+    // false `stable` verdict on a corrupted file. The validator makes it a crash.
+    const bad = '<testsuites><testsuite name="x"></testsuites>';
+    expect(() => junitParser.parse(bad)).toThrow(/^Invalid JUnit XML:/);
   });
 });
 
@@ -187,33 +255,20 @@ describe("A-series: junitParser.parse", () => {
 
 describe("B-series: getParser", () => {
   it("B1 — getParser('junit') returns the junit parser", () => {
-    const p = getParser("junit");
-    console.log(`\n[B1] getParser('junit').name = ${p.name}`);
-    expect(p.name).toBe("junit");
+    expect(getParser("junit").name).toBe("junit");
   });
 
   it("B2 — getParser('json') throws actionable error", () => {
-    let threw: Error | undefined;
-    try {
-      getParser("json");
-    } catch (e) {
-      threw = e as Error;
-    }
-    console.log(`\n[B2] THREW: ${threw?.message}`);
-    expect(threw?.message).toBe(
+    // `json` passes the config schema but has no adapter yet, so this must fail
+    // early (run.ts resolves the parser BEFORE sweeping) with a message that says
+    // what IS supported.
+    expect(() => getParser("json")).toThrow(
       'No parser available for reporter "json". Supported reporters: junit.',
     );
   });
 
   it("B3 — getParser('mocha') throws actionable error", () => {
-    let threw: Error | undefined;
-    try {
-      getParser("mocha");
-    } catch (e) {
-      threw = e as Error;
-    }
-    console.log(`\n[B3] THREW: ${threw?.message}`);
-    expect(threw?.message).toBe(
+    expect(() => getParser("mocha")).toThrow(
       'No parser available for reporter "mocha". Supported reporters: junit.',
     );
   });
