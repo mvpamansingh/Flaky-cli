@@ -2,20 +2,22 @@ import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { TOOL_NAME } from "../version.js";
 
 /**
  * Unique temp results paths, one per run.
  *
  * Rule #4: never rely on a single overwritten path. Each run writes to its own
  * freshly-named file so a crashed run can never be read as a previous run's
- * stale success. Files live under the OS temp dir in a `flaky-detective/`
- * namespace so they're easy to find and safe to leave for the OS to reap.
+ * stale success. Files live under the OS temp dir in a namespace named after the
+ * tool so they're easy to find and safe to leave for the OS to reap.
  *
- * Leaf module: imports nothing else in `src/`.
+ * Leaf module: the only thing it imports from `src/` is the `TOOL_NAME` constant
+ * (itself a leaf), so the temp namespace can't drift from the published name.
  */
 
 /** Directory (under the OS temp dir) that holds all of our per-run results. */
-export const RESULTS_DIR = join(tmpdir(), "flaky-detective");
+export const RESULTS_DIR = join(tmpdir(), TOOL_NAME);
 
 /**
  * Create (if needed) and return a unique absolute path for one run's results.
