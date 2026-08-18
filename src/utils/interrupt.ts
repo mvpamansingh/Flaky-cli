@@ -24,6 +24,26 @@ export type InterruptCleanup = () => void;
 
 const cleanups = new Set<InterruptCleanup>();
 
+let aborting = false;
+
+/**
+ * True once an abort has begun.
+ *
+ * Exposed because a child dying is not the same event as a run *finishing*: when the
+ * user hits Ctrl-C, the OS may kill the spawned shell, which settles the subprocess
+ * promise and would normally make `core/runner.ts` deregister that pid as "done" — in
+ * a race against the cleanup that still needs it to find the tree. Reading this flag
+ * lets the run loop keep the pid while we are on our way out.
+ */
+export function isAborting(): boolean {
+  return aborting;
+}
+
+/** Test seam: clear the abort flag between cases. */
+export function resetAborting(): void {
+  aborting = false;
+}
+
 /**
  * Register work to do if the user aborts. Returns an unregister function; callers
  * that finish normally should call it so a completed sweep leaves nothing behind.
@@ -79,7 +99,6 @@ export function installInterruptHandler(notify: (message: string) => void): void
   if (installed) return;
   installed = true;
 
-  let aborting = false;
   const handle = (signal: "SIGINT" | "SIGTERM") => {
     if (aborting) {
       // Second press: no cleanup, no niceties.

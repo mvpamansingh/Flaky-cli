@@ -1,10 +1,10 @@
-import { spawn } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { readFile, rm, stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { execa } from "execa";
 import type { Config } from "../config/schema.js";
 import type { RawRun } from "../types.js";
-import { onInterrupt } from "../utils/interrupt.js";
+import { isAborting, onInterrupt } from "../utils/interrupt.js";
 import { toPosix, uniqueResultsPath } from "../utils/tempfile.js";
 
 /**
@@ -26,6 +26,12 @@ const RESULTS_PLACEHOLDER = "{results}";
 
 /** After a timeout SIGTERM, wait this long before escalating to SIGKILL (POSIX). */
 const FORCE_KILL_DELAY_MS = 5_000;
+
+/**
+ * Ceiling on the Windows process-table read. Generous (it normally takes well under a
+ * second) but bounded, so a wedged shell can't hold a user's Ctrl-C hostage.
+ */
+const PROCESS_TABLE_TIMEOUT_MS = 5_000;
 
 /**
  * Pids of test-command trees we currently own, so an aborting process can take them
@@ -100,6 +106,13 @@ export async function runOnce({
       reject: false, // rule #2: non-zero exit is data, not a thrown error
       // POSIX: give the child its own process group so we can signal the whole
       // tree (the shell AND everything it spawns). On Windows we use taskkill /T.
+      //
+      // Windows MUST NOT detach, even though it would fix the Ctrl-C orphan bug
+      // (see killTree): `detached` there means DETACHED_PROCESS, which denies the
+      // child our console — and a console app like `cmd.exe` responds by
+      // allocating its OWN, so every single run of the sweep pops a console
+      // window on screen. Tried it; N runs means N flashing windows, which is a
+      // far worse defect than the one it fixes.
       detached: !isWindows,
       // Third injection option: reporters that read an env var instead of a
       // flag. It points at the SAME file we read back (`expectedFile`), so a
@@ -134,7 +147,11 @@ export async function runOnce({
     } finally {
       clearTimeout(killTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
-      if (pid !== undefined) activePids.delete(pid);
+      // Don't deregister mid-abort. Ctrl-C often kills the spawned shell, which
+      // settles this promise and lands us here — but the cleanup still needs that
+      // pid to find the descendants it must kill. Losing the race here is how a
+      // whole test suite gets left running.
+      if (pid !== undefined && !isAborting()) activePids.delete(pid);
     }
   } catch (err) {
     // With reject:false, execa doesn't throw on non-zero exit — reaching here
@@ -202,9 +219,21 @@ export async function runOnce({
  */
 function killTree(pid: number, signal: NodeJS.Signals): void {
   if (process.platform === "win32") {
-    // No signalable process group on Windows; taskkill /T walks the tree and /F
-    // forces termination. Fire-and-forget — we don't await the reaper.
-    spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" }).on("error", () => {});
+    // We can't use `taskkill /T` alone. `/T` walks the LIVE parent→child chain,
+    // and on Ctrl-C Windows broadcasts the console event to every attached
+    // process — so `cmd.exe` (the only pid we hold) is usually dead before we
+    // run, the chain to the real test process is severed, and taskkill silently
+    // kills nothing. Verified: a hanging grandchild outlived an abort by minutes.
+    //
+    // The parent *link* survives that death though: a process keeps its recorded
+    // ParentProcessId even when that parent is gone. So we read the table
+    // ourselves, walk the links down from our shell pid, and kill each pid found.
+    //
+    // All SYNCHRONOUS: the interrupt handler calls `process.exit()` as soon as
+    // cleanups return, so anything async would race our own exit.
+    for (const target of windowsDescendants(pid)) {
+      spawnSync("taskkill", ["/PID", String(target), "/F"], { stdio: "ignore" });
+    }
     return;
   }
   // `detached` made `pid` a process-group leader; a negative pid signals the group.
@@ -213,6 +242,91 @@ function killTree(pid: number, signal: NodeJS.Signals): void {
   } catch {
     // The group already exited (or was reaped) — nothing left to kill.
   }
+}
+
+/** One row of the OS process table: a process and the parent it was spawned by. */
+export interface ProcessLink {
+  pid: number;
+  parentPid: number;
+}
+
+/**
+ * Every pid in `root`'s subtree, deepest first, including `root` itself. PURE — the
+ * process table is passed in, so the tree-walking logic is unit-testable without
+ * spawning anything.
+ *
+ * Deepest-first so we kill leaves before their parents: a dying parent can otherwise
+ * get a moment to spawn more work. Cycles are impossible in a real table but a `seen`
+ * set makes a corrupt one harmless rather than infinite.
+ */
+export function descendantClosure(root: number, links: ProcessLink[]): number[] {
+  const childrenOf = new Map<number, number[]>();
+  for (const { pid, parentPid } of links) {
+    const siblings = childrenOf.get(parentPid);
+    if (siblings) siblings.push(pid);
+    else childrenOf.set(parentPid, [pid]);
+  }
+
+  const ordered: number[] = [];
+  const seen = new Set<number>();
+  const visit = (pid: number): void => {
+    if (seen.has(pid)) return;
+    seen.add(pid);
+    for (const child of childrenOf.get(pid) ?? []) visit(child);
+    ordered.push(pid); // after its children — post-order gives deepest-first
+  };
+  visit(root);
+  return ordered;
+}
+
+/**
+ * Read the Windows process table as (pid, parentPid) pairs.
+ *
+ * PowerShell rather than `wmic`: wmic is deprecated and already removed from recent
+ * Windows 11 builds, and this has to work on the machine the user actually has.
+ * `windowsHide` matters — an unhidden console app would flash a window on screen,
+ * which is the defect that sank the first attempt at this fix.
+ *
+ * Returns an empty list on any failure (missing shell, timeout, junk output). The
+ * caller then falls back to killing just the pid it knows, which is exactly the old
+ * behaviour — degraded, never worse.
+ */
+function readWindowsProcessTable(): ProcessLink[] {
+  const result = spawnSync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }',
+    ],
+    { encoding: "utf8", windowsHide: true, timeout: PROCESS_TABLE_TIMEOUT_MS },
+  );
+
+  if (result.error || typeof result.stdout !== "string") return [];
+
+  const links: ProcessLink[] = [];
+  for (const line of result.stdout.split("\n")) {
+    const [rawPid, rawParent] = line.trim().split(/\s+/);
+    const pid = Number(rawPid);
+    const parentPid = Number(rawParent);
+    if (Number.isInteger(pid) && Number.isInteger(parentPid)) links.push({ pid, parentPid });
+  }
+  return links;
+}
+
+/**
+ * Pids to kill for a Windows run: `root` plus everything descended from it.
+ *
+ * Note the residual risk: we match on pid, and Windows can eventually recycle a pid.
+ * The window here is the few hundred milliseconds between the abort and the sweep, so
+ * a recycled pid landing in our subtree is vanishingly unlikely — and the alternative
+ * (leaving a user's whole suite running) is the certain harm.
+ */
+function windowsDescendants(root: number): number[] {
+  const links = readWindowsProcessTable();
+  if (links.length === 0) return [root];
+  return descendantClosure(root, links);
 }
 
 /** Build a crashed {@link RawRun}. */
