@@ -13,11 +13,41 @@ npx flaky-test-detective init     # answer 5 questions
 npx flaky-test-detective run -n 20
 ```
 
-> **Demo GIF — one command away.** [`demo.tape`](./demo.tape) is a ready
-> [vhs](https://github.com/charmbracelet/vhs) script: `vhs demo.tape` records a real
-> sweep (themed spinner, table, diagnosis legend) to `docs/demo.gif`, then embed it
-> here. Recording needs `vhs` and an actual terminal, which is why the tape is
-> committed and the GIF isn't.
+![flaky-test-detective running a sweep and reporting two flaky tests](./docs/demo.gif)
+
+*One command. It runs your existing suite 8 times, finds the two tests that changed
+their answer on unchanged code, and tells you which one is broken from the inside and
+which one only breaks in company.*
+
+---
+
+## What it gives you
+
+- **Names.** A ranked list of exactly which tests are unreliable, worst-first, with a
+  measured flake rate — not a hunch, not "I think checkout is sometimes weird".
+- **A direction to look.** `--isolate` splits every flake into *fails on its own*
+  (randomness, timing, races) versus *fails only alongside other tests* (shared state,
+  ordering). That's the difference between an hour of debugging and a day of it.
+- **A separated bug list.** Tests failing 100% of the time are real bugs, not flakes, and
+  get their own section instead of polluting the signal.
+- **Something you can hand over.** `--html` for a self-contained report you can forward,
+  `--json` for CI, `--pdf` for the people who ask for PDFs.
+
+**Who it's for:** anyone whose CI has a "just re-run it" culture. Point it at your suite
+before a release, on a nightly schedule, or the moment someone says "that test is flaky,
+ignore it".
+
+## Contents
+
+[The problem](#the-problem) ·
+[How it works](#how-it-works) ·
+[Quickstart](#quickstart-30-seconds) ·
+[What you get](#what-you-get) ·
+[Diagnosis](#the-diagnosis-column---isolate) ·
+[Exports](#exports) ·
+[Commands](#command-reference) ·
+[Limitations](#honest-limitations) ·
+[Roadmap](#roadmap)
 
 ---
 
@@ -247,6 +277,8 @@ would put a flaky test inside the flake detector.
 
 Architecture: [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md). Phase-by-phase build log:
 [`docs/phases/`](./docs/phases).
+
+
 
 ## License
 
