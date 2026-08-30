@@ -28,7 +28,7 @@
   "type": "module",
   "license": "MIT",
   "bin": {
-    "flaky": "./dist/cli.js"
+    "flaky": "dist/cli.js"
   },
   "files": ["dist"],
   "engines": {
